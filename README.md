@@ -1,69 +1,86 @@
 # ArchiBox Agent
 
-Windows agent for **ArchiBox** — ESP32-S3 USB HID PC control powered by ArchiMade.
+**ArchiBox** = clé physique ESP32-S3 (future XIAO ESP32S3 Sense) qui, branchée en USB sur un PC, donne à **archimade** des yeux et des mains sur ce PC.
 
-Insert the USB key → the agent launches automatically and takes control of the PC keyboard/mouse. Eject the key → everything stops and cleans up.
+Branches l'ESP → archimade reçoit la connexion → notif Telegram → je prends le contrôle clavier/souris.
+Retires l'ESP → archimade détecte la déconnexion → tout s'arrête.
 
 ---
 
 ## Comment ça marche
 
 ```
-[Clé USB insérée]
-  └─> usb-watch.exe (WMI events) détecte la clé
-        └─> Lit token.txt + config.json sur la clé
-              └─> Lance archibox-agent.exe
-                    └─> Poll archimade:8766 (authentifié X-Archibox-Token)
-                          └─> Exécute TYPE / KEY / MOUSE / SCREENSHOT via pynput
+[ESP32-S3 branché en USB]
+  └─> Alimentation + connexion WiFi
+        └─> Poll archimade:8766 (X-Archibox-Token)
+              └─> archimade notifie Cédric sur Telegram
+                    └─> Windows agent (pynput) exécute les commandes
 
-[Clé USB éjectée]
-  └─> usb-watch.exe détecte l'éjection
-        └─> Tue archibox-agent.exe
-              └─> Plus rien ne reste sur le PC
+[ESP débranché]
+  └─> archimade détecte la déconnexion
+        └─> Arrêt propre, rien ne persiste
 ```
+
+**L'ESP n'est pas un périphérique USB** (pas de stockage, pas de HID).
+Il汲 uniquement l'alimenté par USB et communique en WiFi.
+Le contrôle clavier/souris est fait par l'agent Windows.
 
 ---
 
-## Préparation de la clé USB
+## Matériel nécessaire
 
-Sur une clé USB (n'importe quelle taille), crée ces fichiers à la racine :
+| Composant | Rôle | Prix |
+|-----------|------|------|
+| **ESP32-S3** (ou XIAO ESP32S3) | Clé physique — token WiFi | ~8-23€ |
+| Agent Windows (`archibox-agent.exe`) | Contrôle clavier/souris/screenshot | gratuit |
 
-**`token.txt`** — le secret unique de cette clé :
-```
-8f3e9a2c-4b7d-4e1f-9c8a-2d5b6e3c1a7f
-```
+### ESP32-S3 SuperMini (prototype v1)
+- ~8-10€
+- WiFi intégré, 240MHz, 4MB flash
+- Alimenté par USB-C
 
-**`config.json`** — configuration :
-```json
-{
-  "device_id": "esp32s3-box-01",
-  "archimade_host": "192.168.0.119",
-  "archimade_port": 8766
-}
-```
-
-**`archibox.key`** — fichier marqueur (vide ou avec le nom de la clé) :
-```
-ArchiBox
-```
-
-Optionnel : copie `archibox-agent.exe` à la racine de la clé pour avoir tout auto-contenu.
+### XIAO ESP32S3 Sense (prototype v2)
+- ~23€
+- Micro INMP441 intégré (pour voix)
+- USB-C, compact
 
 ---
 
-## Installation sur un PC Windows
+## Préparation de l'ESP
 
-### Méthode automatique (recommandée)
+Flash le firmware avec ton token :
 
-1. Télécharge la dernière release depuis : https://github.com/thecozmopolite/archibox-agent/releases
-2. Exécute `install.bat` **en tant qu'administrateur**
-3. C'est fini — le watchdog tourne en arrière-plan
-
-### Désinstallation
+```python
+import uuid
+print(uuid.uuid4())  # génère le token
 ```
-scripts\uninstall.bat   (en admin)
+
+Le token `0ea3bbbc-8035-4c24-a551-14094f74daf1` est déjà enregistré côté archimade.
+
+Configure le WiFi + token dans `platformio.ini` ou via `arduino_secrets.h`, puis flash.
+
+---
+
+## Installation sur PC Windows
+
+### 1. Installe Python + dépendances
+```powershell
+# Python 3.10+ requis
+pip install pyinstaller pynput mss requests
 ```
-→ arrête les processus, supprime l'entrée démarrage, rien d'autre.
+
+### 2. Génère le .exe
+```bash
+pyinstaller --onefile --name archibox-agent --console agent/agent.py
+```
+
+### 3. Installe
+```powershell
+# En admin
+install.bat
+```
+
+Le service tourne en arrière-plan. Il se connecte à archimade avec le token de l'ESP.
 
 ---
 
@@ -71,41 +88,28 @@ scripts\uninstall.bat   (en admin)
 
 | Commande | Description |
 |----------|-------------|
-| `TYPE Bonjour le monde` | Tape le texte |
-| `KEY WIN R` | Appuie sur la touche Windows |
-| `KEY CTRL C` | Raccourci Ctrl+C |
-| `MOUSE 100 50` | Déplace la souris de +100/+50 px |
+| `TYPE Bonjour` | Tape le texte |
+| `KEY WIN R` | Touche Windows |
+| `KEY CTRL C` | Raccourci clavier |
+| `MOUSE 100 50` | Déplacement relatif |
 | `CLICK left` | Clic gauche |
 | `CLICK right` | Clic droit |
-| `SCROLL 0 -3` | Scroll vers le bas |
-| `SCREENSHOT` | Prend une capture et l'envoie à archimade |
+| `SCREENSHOT` | Capture d'écran |
 | `STOP` | Arrête l'agent |
-
----
-
-## Générer un token
-
-```python
-import uuid
-print(uuid.uuid4())
-# ex: 8f3e9a2c-4b7d-4e1f-9c8a-2d5b6e3c1a7f
-```
-
-Chaque clé USB = un token différent. Le token est validé côté serveur archimade.
 
 ---
 
 ## Développement
 
 ```bash
-# Build agent Windows (.exe)
+# Agent Windows
 pip install pyinstaller pynput mss requests
 pyinstaller --onefile --name archibox-agent --console agent/agent.py
 
-# Build USB watchdog (nécessite .NET 8)
+# USB watchdog (C# / .NET 8)
 cd usb-watch && dotnet build -c Release
 
-# Lancer en local (sans USB)
+# Lancer agent manuellement
 python agent/agent.py <token> <device_id> <archimade_host> [port]
 ```
 
@@ -113,11 +117,10 @@ python agent/agent.py <token> <device_id> <archimade_host> [port]
 
 ## Sécurité
 
-- Le token est lu uniquement depuis la clé USB physique → pas de fichier sur le PC
-- Chaque requête HTTP inclut le header `X-Archibox-Token`
-- Le serveur archimade valide le token avant d'accepter les commandes
-- Pas de persistence sur le PC : le token n'est jamais écrit sur le disque
-- Agent.exe se ferme et disparaît quand la clé est retirée
+- Token stocké uniquement dans la flash de l'ESP → pas sur le PC
+- Header `X-Archibox-Token` validé côté serveur archimade
+- Token révocable à distance (`DELETE /admin/token/{token}`)
+- Aucune persistence sur le PC quand l'ESP est débranché
 
 ---
 
@@ -126,14 +129,14 @@ python agent/agent.py <token> <device_id> <archimade_host> [port]
 ```
 archibox-agent/
 ├── agent/
-│   └── agent.py          # Agent principal (Python + pynput)
+│   └── agent.py          # Agent Windows (Python + pynput)
 ├── usb-watch/
 │   ├── Program.cs         # Watchdog USB (C# / .NET 8)
-│   └── usb-watch.csproj  # Projet .NET
+│   └── usb-watch.csproj
 ├── scripts/
-│   ├── install.bat       # Script d'installation
-│   └── uninstall.bat     # Script de désinstallation
+│   ├── install.bat
+│   └── uninstall.bat
 └── .github/
     └── workflows/
-        └── build.yml     # CI: compile les deux .exe
+        └── build.yml     # CI: compile les .exe
 ```
