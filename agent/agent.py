@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-ArchiBox Agent — Windows PC control via ESP32 USB HID
-Polls archimade:8766 and executes TYPE/KEY/MOUSE commands via pynput.
+ArchiBox Agent v0.3.0 — Windows PC control via ESP32 USB Serial
+- Reçoit le token de l'ESP via USB Serial
+- Poll archimade avec ce token
+- Exécute les commandes HID via pynput
 """
 import sys
 import os
@@ -9,21 +11,25 @@ import time
 import json
 import socket
 import threading
+import serial
+import serial.tools.list_ports
 import urllib.request
 import urllib.error
 import base64
+import io
 
-# ── Config from key (passed as CLI args or read from USB key) ─────────────────
+VERSION = "0.3.0"
+running = True
+
+# ── Config auto-detectée ────────────────────────────────────────────────────
 ARCHIMADE_HOST = "192.168.0.119"
 ARCHIMADE_PORT = 8766
-DEVICE_ID = "win-pc-01"
-DEVICE_TOKEN = ""
 ARCHIMADE_SERVER = f"http://{ARCHIMADE_HOST}:{ARCHIMADE_PORT}"
+DEVICE_ID = "win-pc-01"
+DEVICE_TOKEN = None          # reçu de l'ESP
 POLL_INTERVAL = 2.0
-HEALTH_PORT = 8767
-VERSION = "0.2.0"
-
-running = True
+esp_token = None            # token broadcasté par l'ESP
+ser = None
 
 
 def log(msg, level="INFO"):
@@ -39,35 +45,95 @@ def log(msg, level="INFO"):
         pass
 
 
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
+# ── ESP Serial ───────────────────────────────────────────────────────────────
 
-def api_headers():
+def find_esp_port():
+    """Trouve le port COM de l'ESP32-S3-Box."""
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        # ESP32-S3-Box apparaît comme "USB Serial" ou "Silicon Labs CP210x"
+        desc = p.description or ""
+        if any(k in desc.lower() for k in ["usb serial", "cp210", "ch340", "ch343", "esp", "arduino"]):
+            log(f"ESP found: {p.device} — {desc}")
+            return p.device
+    # Fallback: premier port dispo
+    if ports:
+        log(f"No ESP identified — using {ports[0].device} as fallback")
+        return ports[0].device
+    return None
+
+
+def serial_read_line(timeout=5.0):
+    """Lit une ligne depuis l'ESP (bloquante, timeout)."""
+    if not ser:
+        return None
+    old = ser.timeout
+    ser.timeout = timeout
+    try:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        return line if line else None
+    except Exception as e:
+        log(f"Serial read error: {e}", "ERROR")
+        return None
+    finally:
+        ser.timeout = old
+
+
+def serial_write(msg):
+    """Envoie un message à l'ESP."""
+    if not ser:
+        return
+    try:
+        ser.write((msg + "\n").encode())
+        ser.flush()
+    except Exception as e:
+        log(f"Serial write error: {e}", "ERROR")
+
+
+def wait_for_token():
+    """Attend le TOKEN:<uuid> de l'ESP."""
+    log("Waiting for TOKEN from ESP...")
+    while running:
+        line = serial_read_line(timeout=10.0)
+        if line and line.startswith("TOKEN:"):
+            token = line[6:].strip()
+            log(f"TOKEN received from ESP: {token[:8]}...")
+            return token
+        elif line:
+            log(f"ESP [unexpected]: {line[:60]}")
+    return None
+
+
+# ── HTTP helpers ────────────────────────────────────────────────────────────
+
+def api_headers(token):
     return {
         "User-Agent": f"ArchiBox-Agent/{VERSION}",
-        "X-Archibox-Token": DEVICE_TOKEN,
+        "X-Archibox-Token": token,
         "X-Archibox-Device": DEVICE_ID,
         "Content-Type": "application/json",
     }
 
 
-def http_get(path, timeout=5):
+def http_get(path, token, timeout=5):
     url = f"{ARCHIMADE_SERVER}{path}"
-    req = urllib.request.Request(url, headers=api_headers())
+    req = urllib.request.Request(url, headers=api_headers(token))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        log(f"HTTP {e.code}: {path}")
+        if e.code == 401:
+            log("Unauthorized — token may be revoked", "ERROR")
         return None
     except Exception as e:
         log(f"GET {path}: {e}")
         return None
 
 
-def http_post(path, data=None, timeout=5):
+def http_post(path, token, data=None, timeout=5):
     url = f"{ARCHIMADE_SERVER}{path}"
     body = json.dumps(data or {}).encode()
-    req = urllib.request.Request(url, data=body, headers=api_headers())
+    req = urllib.request.Request(url, data=body, headers=api_headers(token))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -76,7 +142,7 @@ def http_post(path, data=None, timeout=5):
         return None
 
 
-# ── Keyboard / Mouse via pynput ────────────────────────────────────────────────
+# ── HID via pynput ──────────────────────────────────────────────────────────
 
 def init_pynput():
     try:
@@ -84,7 +150,7 @@ def init_pynput():
         from pynput.mouse import Controller as MouseCtrl
         return True
     except ImportError:
-        log("ERROR: pynput not installed. Run: pip install pynput", "ERROR")
+        log("pynput not installed — run: pip install pynput", "ERROR")
         return False
 
 
@@ -183,7 +249,7 @@ def mouse_scroll(dx, dy):
         return False
 
 
-# ── Screenshot ─────────────────────────────────────────────────────────────────
+# ── Screenshot ───────────────────────────────────────────────────────────────
 
 def take_screenshot():
     try:
@@ -200,7 +266,7 @@ def take_screenshot():
         return None
 
 
-# ── Command dispatch ────────────────────────────────────────────────────────────
+# ── Command execution ────────────────────────────────────────────────────────
 
 def execute(cmd):
     log(f"EXEC: {cmd}")
@@ -209,24 +275,18 @@ def execute(cmd):
     if not cmd or cmd == "PING":
         return True
 
-    # DELAY n — attend n millisecondes (permet de calibrer les sequences)
     if cmd.startswith("DELAY "):
         try:
             ms = int(cmd[6:].strip())
             time.sleep(ms / 1000.0)
-            log(f"DELAY done: {ms}ms")
             return True
         except ValueError:
-            log(f"DELAY: invalid value: {cmd[6:]}", "ERROR")
             return False
 
     if cmd.startswith("TYPE "):
-        text = cmd[5:]
-        log(f"TYPE: {text[:50]}{'...' if len(text) > 50 else ''}")
-        return type_text(text)
+        return type_text(cmd[5:])
 
     if cmd.startswith("KEY "):
-        log(f"KEY: {cmd[4:]}")
         return press_key(cmd[4:])
 
     if cmd.startswith("MOUSE ") and len(cmd) > 6:
@@ -244,53 +304,87 @@ def execute(cmd):
     if "SCROLL" in cmd:
         parts = cmd.split()
         try:
-            dx = int(parts[-2])
-            dy = int(parts[-1])
-            return mouse_scroll(dx, dy)
+            return mouse_scroll(int(parts[-2]), int(parts[-1]))
         except (ValueError, IndexError):
             pass
 
     if cmd == "SCREENSHOT":
-        log("SCREENSHOT: capturing...")
         data = take_screenshot()
-        if data:
-            log(f"SCREENSHOT: {len(data)} bytes sent")
-            http_post(f"/screenshot/{DEVICE_ID}", {"data": data})
-        else:
-            log("SCREENSHOT: failed", "ERROR")
+        if data and esp_token:
+            http_post(f"/screenshot/{DEVICE_ID}", esp_token, {"data": data})
         return True
 
     if cmd == "STOP":
         global running
         running = False
-        log("STOP received")
         return True
 
     log(f"Unknown command: {cmd}")
     return False
 
 
-# ── Registration + poll loop ────────────────────────────────────────────────────
+# ── ESP serial reader thread ────────────────────────────────────────────────
 
-def register():
+def esp_reader():
+    """Thread qui lit les commandes de l'ESP et les exécute."""
+    global running
+    while running:
+        line = serial_read_line(timeout=5.0)
+        if not line:
+            continue
+
+        if line.startswith("CMD:"):
+            cmd = line[4:].strip()
+            log(f"CMD from ESP: {cmd[:60]}")
+            ok = execute(cmd)
+            serial_write("OK" if ok else "ERR")
+
+        elif line.startswith("PING"):
+            serial_write("PONG")
+
+        elif line.startswith("TOKEN:"):
+            global esp_token
+            esp_token = line[6:].strip()
+            log(f"TOKEN update from ESP: {esp_token[:8]}...")
+
+        elif line == "STOP":
+            running = False
+            log("STOP from ESP")
+            serial_write("OK")
+
+        elif line:
+            log(f"ESP: {line[:60]}")
+
+
+# ── Poll archimade ───────────────────────────────────────────────────────────
+
+def register(token):
     hostname = socket.gethostname()
-    r = http_get(f"/register?device_id={DEVICE_ID}&type=windows-agent&hostname={hostname}")
+    r = http_get(f"/register?device_id={DEVICE_ID}&type=windows-agent&hostname={hostname}", token)
     if r:
         log(f"Registered: {r}")
     return r is not None
 
 
-def poll_loop():
-    global running
-    register()
+def poll_archimade():
+    """Boucle de polling — utilise le token de l'ESP."""
+    global esp_token, running
+
+    # 1. Attendre le token de l'ESP
+    esp_token = wait_for_token()
+    if not esp_token:
+        log("No token from ESP — exiting", "ERROR")
+        return
+
+    register(esp_token)
 
     while running:
         try:
-            data = http_get(f"/poll/{DEVICE_ID}")
+            data = http_get(f"/poll/{DEVICE_ID}", esp_token)
             if data:
                 cmd = data.get("cmd")
                 if cmd:
-                    log(f"CMD: {cmd}")
+                    log(f"CMD from archimade: {cmd[:60]}")
                     execute(cmd)
         except Exception as e:
             log(f"Poll error: {e}", "ERROR")
@@ -301,9 +395,9 @@ def poll_loop():
             time.sleep(0.1)
 
 
-# ── Health HTTP server ─────────────────────────────────────────────────────────
+# ── Health HTTP server ────────────────────────────────────────────────────────
 
-def health_server(port=HEALTH_PORT):
+def health_server(port=8767):
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class H(BaseHTTPRequestHandler):
@@ -318,7 +412,8 @@ def health_server(port=HEALTH_PORT):
                         "status": "ok",
                         "version": VERSION,
                         "device_id": DEVICE_ID,
-                        "hostname": socket.gethostname(),
+                        "esp_connected": ser is not None,
+                        "token_received": esp_token is not None,
                         "archimade": ARCHIMADE_SERVER,
                         "running": running,
                     }).encode())
@@ -332,42 +427,54 @@ def health_server(port=HEALTH_PORT):
         log(f"Health server error: {e}", "ERROR")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    global ARCHIMADE_HOST, ARCHIMADE_PORT, DEVICE_ID, DEVICE_TOKEN, ARCHIMADE_SERVER
+    global ser, DEVICE_ID
 
     print(f"ArchiBox Agent v{VERSION}")
     print("=" * 40)
 
-    # Parse CLI args: agent.py <token> <device_id> <archimade_host> [archimade_port]
+    # Auto-detect ESP COM port
+    esp_port = find_esp_port()
+    if not esp_port:
+        input("Aucun ESP détecté. Branche l'ESP et appuie sur Entrée...")
+
+    # Parse device_id optionnel
     if len(sys.argv) >= 2:
-        DEVICE_TOKEN = sys.argv[1]
-    if len(sys.argv) >= 3:
-        DEVICE_ID = sys.argv[2]
-    if len(sys.argv) >= 4:
-        ARCHIMADE_HOST = sys.argv[3]
-    if len(sys.argv) >= 5:
-        ARCHIMADE_PORT = int(sys.argv[4])
+        DEVICE_ID = sys.argv[1]
 
-    ARCHIMADE_SERVER = f"http://{ARCHIMADE_HOST}:{ARCHIMADE_PORT}"
-
-    if not DEVICE_TOKEN:
-        log("ERROR: No token provided. Usage: archibox-agent.exe <token> [device_id] [archimade_host] [port]", "ERROR")
+    log(f"Connecting to ESP on {esp_port or 'auto'}...")
+    try:
+        ser = serial.Serial(
+            port=esp_port,
+            baudrate=115200,
+            timeout=5.0,
+            write_timeout=5.0,
+        )
+        # Attendre que l'ESP soit prêt
+        time.sleep(1.5)
+        ser.reset_input_buffer()
+        log("ESP serial connected")
+    except Exception as e:
+        log(f"Cannot open {esp_port}: {e}", "ERROR")
         sys.exit(1)
 
-    log(f"Token: {DEVICE_TOKEN[:8]}...")
-    log(f"Device: {DEVICE_ID}")
-    log(f"Archimade: {ARCHIMADE_SERVER}")
-    log(f"Hostname: {socket.gethostname()}")
-    log(f"pynput ready: {_pynput_ready}")
+    # Démarrer le reader série ESP
+    reader_t = threading.Thread(target=esp_reader, daemon=True)
+    reader_t.start()
 
-    # Start health server in background thread
-    t = threading.Thread(target=health_server, daemon=True)
-    t.start()
-    log(f"Health server: http://localhost:{HEALTH_PORT}/health")
+    # Health server
+    health_t = threading.Thread(target=health_server, daemon=True)
+    health_t.start()
+    log(f"Health server: http://localhost:8767/health")
 
-    poll_loop()
+    # Poll archimade avec le token ESP
+    poll_archimade()
+
+    # Cleanup
+    if ser:
+        ser.close()
     log("Agent stopped.")
 
 
