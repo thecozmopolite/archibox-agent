@@ -16,7 +16,7 @@ import base64
 # ── Config from key (passed as CLI args or read from USB key) ─────────────────
 ARCHIMADE_HOST = "192.168.0.119"
 ARCHIMADE_PORT = 8766
-DEVICE_ID = "esp32s3-box-01"
+DEVICE_ID = "win-pc-01"
 DEVICE_TOKEN = ""
 ARCHIMADE_SERVER = f"http://{ARCHIMADE_HOST}:{ARCHIMADE_PORT}"
 POLL_INTERVAL = 2.0
