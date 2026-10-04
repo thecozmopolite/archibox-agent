@@ -18,8 +18,9 @@ import urllib.error
 import base64
 import io
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 running = True
+_serial_lock = threading.Lock()  # Serial port access guard
 
 # ── Config auto-detectée ────────────────────────────────────────────────────
 ARCHIMADE_HOST = "192.168.0.119"
@@ -67,27 +68,29 @@ def serial_read_line(timeout=5.0):
     """Lit une ligne depuis l'ESP (bloquante, timeout)."""
     if not ser:
         return None
-    old = ser.timeout
-    ser.timeout = timeout
-    try:
-        line = ser.readline().decode("utf-8", errors="ignore").strip()
-        return line if line else None
-    except Exception as e:
-        log(f"Serial read error: {e}", "ERROR")
-        return None
-    finally:
-        ser.timeout = old
+    with _serial_lock:
+        old = ser.timeout
+        ser.timeout = timeout
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            return line if line else None
+        except Exception as e:
+            log(f"Serial read error: {e}", "ERROR")
+            return None
+        finally:
+            ser.timeout = old
 
 
 def serial_write(msg):
     """Envoie un message à l'ESP."""
     if not ser:
         return
-    try:
-        ser.write((msg + "\n").encode())
-        ser.flush()
-    except Exception as e:
-        log(f"Serial write error: {e}", "ERROR")
+    with _serial_lock:
+        try:
+            ser.write((msg + "\n").encode())
+            ser.flush()
+        except Exception as e:
+            log(f"Serial write error: {e}", "ERROR")
 
 
 def wait_for_token():
@@ -266,6 +269,190 @@ def take_screenshot():
         return None
 
 
+# ── Audio chunk reader ─────────────────────────────────────────────────────────
+# Protocol: ESP sends  SIZE:NNNNN\n  then N bytes of PCM  then  ###END###\n
+
+import wave
+import tempfile
+import re as _re
+
+
+def _parse_size_from_buf(buf):
+    """Extract audio size from buffer containing SIZE:N\\n line."""
+    text = buf.decode('utf-8', errors='ignore')
+    for line in text.split('\n'):
+        m = _re.match(r'SIZE:(\d+)', line.strip())
+        if m:
+            return int(m.group(1)), buf.find(line.encode())
+    return None, -1
+
+
+def read_audio_chunk(serial_conn, timeout=30):
+    """Read one audio chunk from ESP. Returns PCM bytes or None."""
+    t0 = time.time()
+    raw = b''
+    audio_data = b''
+
+    # Per-read locking: lock only during each read() call
+    # This allows esp_reader to interleave line reads during chunk transfer
+
+    # Wait for first byte > 127 (start of PCM data after SIZE line)
+    while time.time() - t0 < timeout:
+        if serial_conn.in_waiting:
+            with _serial_lock:
+                chunk = serial_conn.read(serial_conn.in_waiting)
+            raw += chunk
+
+            # Find SIZE: line in what we've read
+            for line in raw.decode('utf-8', errors='ignore').split('\n'):
+                m = _re.match(r'SIZE:(\d+)', line.strip())
+                if m:
+                    target_size = int(m.group(1))
+                    nl_pos = raw.find((line + '\n').encode())
+                    audio_start = nl_pos + len(line) + 1
+                    audio_data = raw[audio_start:]
+                    break
+
+            if audio_data and audio_data[0] > 127:
+                break
+        time.sleep(0.02)
+
+    if not audio_data:
+        return None
+
+    # Read remaining bytes to reach target_size
+    target_size = len(audio_data) + 1  # rough estimate
+    # Re-parse properly
+    m = _re.search(rb'SIZE:(\d+)', raw)
+    if not m:
+        return None
+    target_size = int(m.group(1))
+    nl_pos = m.start() + m.end()
+    audio_start = nl_pos + 1
+    audio_data = raw[audio_start:]
+
+    # Read exact byte count
+    while len(audio_data) < target_size and time.time() - t0 < timeout:
+        if serial_conn.in_waiting:
+            with _serial_lock:
+                got = serial_conn.read(min(serial_conn.in_waiting, target_size - len(audio_data)))
+            audio_data += got
+        else:
+            time.sleep(0.02)
+
+    # Drain until ###END###
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if serial_conn.in_waiting:
+            with _serial_lock:
+                serial_conn.read(serial_conn.in_waiting)
+            break
+        time.sleep(0.05)
+
+    if len(audio_data) >= target_size * 0.9:
+        return audio_data[:target_size]
+    return None
+
+
+def write_wav(path, pcm_bytes, sample_rate=16000):
+    n = len(pcm_bytes) // 2
+    with wave.open(path, 'wb') as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(pcm_bytes)
+
+
+# ── Whisper transcription ────────────────────────────────────────────────────
+
+_whisper_model = None
+
+
+def whisper_load():
+    global _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+        model_name = os.environ.get('WHISPER_MODEL', 'small')
+        log(f"Loading Whisper '{model_name}' (int8 CPU)...")
+        t0 = time.time()
+        _whisper_model = WhisperModel(model_name, device='cpu', compute_type='int8')
+        log(f"Whisper ready in {time.time()-t0:.1f}s")
+        return True
+    except ImportError:
+        log("faster-whisper not installed — audio transcription disabled", "WARNING")
+        return False
+    except Exception as e:
+        log(f"Whisper load error: {e}", "ERROR")
+        return False
+
+
+def whisper_transcribe(pcm_bytes):
+    global _whisper_model
+    if not _whisper_model:
+        return None
+    tmp = tempfile.mktemp(suffix='.wav')
+    try:
+        write_wav(tmp, pcm_bytes)
+        segments, info = _whisper_model.transcribe(tmp, language='fr')
+        text = ''.join(s.text for s in segments).strip()
+        if text:
+            log(f"Whisper: {text}")
+        return text or None
+    except Exception as e:
+        log(f"Whisper error: {e}", "ERROR")
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+# ── Audio thread ─────────────────────────────────────────────────────────────
+
+_audio_thread_running = False
+
+
+def audio_loop(serial_conn, token):
+    """Background thread: reads audio chunks, transcribes, sends to archimade."""
+    global _audio_thread_running, esp_token
+    _audio_thread_running = True
+
+    # Load whisper lazily on first use
+    whisper_loaded = whisper_load()
+
+    while _audio_thread_running and running:
+        chunk = read_audio_chunk(serial_conn, timeout=35)
+        if not chunk:
+            time.sleep(1)
+            continue
+
+        log(f"Audio: {len(chunk)} bytes ({len(chunk)/32000:.1f}s)")
+
+        if whisper_loaded and esp_token:
+            text = whisper_transcribe(chunk)
+            if text:
+                # Send transcription to archimade
+                r = http_post(f"/transcribe/{DEVICE_ID}", esp_token, {
+                    'text': text,
+                    'device_id': DEVICE_ID,
+                })
+                if r:
+                    log(f"Transcription sent to archimade")
+
+
+# ── Mute/unmute ESP32 ────────────────────────────────────────────────────────
+
+def esp_mute():
+    serial_write('MUTE')
+    log("Sent MUTE to ESP32")
+
+
+def esp_unmute():
+    serial_write('UNMUTE')
+    log("Sent UNMUTE to ESP32")
+
+
 # ── Command execution ────────────────────────────────────────────────────────
 
 def execute(cmd):
@@ -314,6 +501,21 @@ def execute(cmd):
             http_post(f"/screenshot/{DEVICE_ID}", esp_token, {"data": data})
         return True
 
+    if cmd == "TRANSCRIBE" and esp_token:
+        # Request audio chunk transcription
+        serial_write('UNMUTE')
+        time.sleep(5)  # Let ESP record
+        serial_write('MUTE')
+        return True
+
+    if cmd == "MUTE":
+        esp_mute()
+        return True
+
+    if cmd == "UNMUTE":
+        esp_unmute()
+        return True
+
     if cmd == "STOP":
         global running
         running = False
@@ -346,6 +548,13 @@ def esp_reader():
             global esp_token
             esp_token = line[6:].strip()
             log(f"TOKEN update from ESP: {esp_token[:8]}...")
+            # Start audio thread once token is known
+            audio_t = threading.Thread(target=audio_loop, args=(ser, esp_token), daemon=True)
+            audio_t.start()
+            log("Audio thread started")
+            # Mic starts muted — unmute after handshake
+            time.sleep(0.5)
+            esp_unmute()
 
         elif line == "STOP":
             running = False
