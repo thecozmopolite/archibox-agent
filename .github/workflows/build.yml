@@ -23,8 +23,8 @@ jobs:
           pyinstaller --onefile --name archibox-agent --console agent/agent.py
           ls -la dist/
 
-      - name: Build usb-watch
-        uses: dotnet/setup-dotnet@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
