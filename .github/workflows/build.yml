@@ -1,0 +1,64 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  build-agent:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller pynput mss requests
+
+      - name: Build archibox-agent.exe
+        run: |
+          pyinstaller --onefile --name archibox-agent --console --additional-hooks-dir . agent/agent.py
+          ls -la dist/
+
+      - name: Build usb-watch
+        uses: dotnet/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish usb-watch
+        working-directory: ./usb-watch
+        run: dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o ../dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archibox-release
+          path: |
+            dist/archibox-agent.exe
+            dist/archibox-usb-watch.exe
+            scripts/install.bat
+            scripts/uninstall.bat
+          retention-days: 90
+
+  release:
+    needs: build-agent
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: archibox-release
+          path: release/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/**
+          generate_release_notes: true
