@@ -21,7 +21,6 @@ jobs:
         run: |
           pip install pyinstaller pynput mss requests
           pyinstaller --onefile --name archibox-agent --console agent/agent.py
-          ls -la dist/
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -61,7 +60,6 @@ jobs:
       - name: Build macOS app bundle
         run: |
           pyinstaller --onefile --name ArchiBoxAgent --console agent/mac/archibox_agent_mac.py
-          ls -la dist/
           mkdir -p "ArchiBoxAgent.app/Contents/MacOS"
           cp dist/ArchiBoxAgent ArchiBoxAgent.app/Contents/MacOS/
           cp -r Resources/ ArchiBoxAgent.app/Contents/ 2>/dev/null || true
