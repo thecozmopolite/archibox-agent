@@ -21,19 +21,20 @@ DEVICE_TOKEN = ""
 ARCHIMADE_SERVER = f"http://{ARCHIMADE_HOST}:{ARCHIMADE_PORT}"
 POLL_INTERVAL = 2.0
 HEALTH_PORT = 8767
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 running = True
 verbose = os.environ.get("ARCHIBOX_VERBOSE", "0") == "1"
 
 
-def log(msg):
+def log(msg, level="INFO"):
     ts = time.strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+    line = f"[{ts}] [{level}] {msg}"
     print(line, flush=True)
     try:
-        os.makedirs(os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "ArchiBox", "logs"), exist_ok=True)
-        with open(os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "ArchiBox", "logs", "agent.log"), "a") as f:
+        log_dir = os.path.join(os.environ.get("LOCALAPPDATA", "/tmp"), "ArchiBox", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "agent.log"), "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -203,6 +204,26 @@ def take_screenshot():
 # ── Command dispatch ────────────────────────────────────────────────────────────
 
 def execute(cmd):
+    global _pynput_ready
+
+    log(f"EXEC: {cmd}")
+    cmd = cmd.strip()
+
+    if not cmd or cmd == "PING":
+        return True
+
+    # DELAY n  — attend n millisecondes (permet de calibrer les sequences)
+    if cmd.startswith("DELAY "):
+        try:
+            ms = int(cmd[6:].strip())
+            time.sleep(ms / 1000.0)
+            log(f"DELAY done: {ms}ms")
+            return True
+        except ValueError:
+            log(f"DELAY: invalid value: {cmd[6:]}")
+            return False
+
+    if cmd.startswith("TYPE "):
     log(f"EXEC: {cmd}")
     cmd = cmd.strip()
 
@@ -210,9 +231,12 @@ def execute(cmd):
         return True
 
     if cmd.startswith("TYPE "):
-        return type_text(cmd[5:])
+        text = cmd[5:]
+        log(f"TYPE: {text[:50]}{'...' if len(text)>50 else ''}")
+        return type_text(text)
 
     if cmd.startswith("KEY "):
+        log(f"KEY: {cmd[4:]}")
         return press_key(cmd[4:])
 
     if cmd.startswith("MOUSE ") and len(cmd) > 6:
@@ -237,9 +261,13 @@ def execute(cmd):
             pass
 
     if cmd == "SCREENSHOT":
+        log("SCREENSHOT: capturing...")
         data = take_screenshot()
         if data:
+            log(f"SCREENSHOT: {len(data)} bytes sent")
             http_post(f"/screenshot/{DEVICE_ID}", {"data": data})
+        else:
+            log("SCREENSHOT: failed", "ERROR")
         return True
 
     if cmd == "STOP":
