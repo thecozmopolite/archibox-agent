@@ -24,7 +24,6 @@ HEALTH_PORT = 8767
 VERSION = "0.2.0"
 
 running = True
-verbose = os.environ.get("ARCHIBOX_VERBOSE", "0") == "1"
 
 
 def log(msg, level="INFO"):
@@ -85,7 +84,7 @@ def init_pynput():
         from pynput.mouse import Controller as MouseCtrl
         return True
     except ImportError:
-        log("ERROR: pynput not installed. Run: pip install pynput")
+        log("ERROR: pynput not installed. Run: pip install pynput", "ERROR")
         return False
 
 
@@ -106,7 +105,7 @@ def type_text(text):
                 pass
         return True
     except Exception as e:
-        log(f"type_text error: {e}")
+        log(f"type_text error: {e}", "ERROR")
         return False
 
 
@@ -141,7 +140,7 @@ def press_key(combo):
             kb.release(k)
         return True
     except Exception as e:
-        log(f"press_key error: {e}")
+        log(f"press_key error: {e}", "ERROR")
         return False
 
 
@@ -153,7 +152,7 @@ def mouse_move(x, y):
         Controller().move(x, y)
         return True
     except Exception as e:
-        log(f"mouse_move error: {e}")
+        log(f"mouse_move error: {e}", "ERROR")
         return False
 
 
@@ -168,7 +167,7 @@ def mouse_click(btn="left"):
         m.release(b)
         return True
     except Exception as e:
-        log(f"mouse_click error: {e}")
+        log(f"mouse_click error: {e}", "ERROR")
         return False
 
 
@@ -180,7 +179,7 @@ def mouse_scroll(dx, dy):
         Controller().scroll(dx, dy)
         return True
     except Exception as e:
-        log(f"mouse_scroll error: {e}")
+        log(f"mouse_scroll error: {e}", "ERROR")
         return False
 
 
@@ -194,25 +193,23 @@ def take_screenshot():
             png = mss.tools.to_png(img.rgb, img.size)
             return base64.b64encode(png).decode()
     except ImportError:
-        log("mss not installed — run: pip install mss")
+        log("mss not installed — run: pip install mss", "ERROR")
         return None
     except Exception as e:
-        log(f"screenshot error: {e}")
+        log(f"screenshot error: {e}", "ERROR")
         return None
 
 
 # ── Command dispatch ────────────────────────────────────────────────────────────
 
 def execute(cmd):
-    global _pynput_ready
-
     log(f"EXEC: {cmd}")
     cmd = cmd.strip()
 
     if not cmd or cmd == "PING":
         return True
 
-    # DELAY n  — attend n millisecondes (permet de calibrer les sequences)
+    # DELAY n — attend n millisecondes (permet de calibrer les sequences)
     if cmd.startswith("DELAY "):
         try:
             ms = int(cmd[6:].strip())
@@ -220,19 +217,12 @@ def execute(cmd):
             log(f"DELAY done: {ms}ms")
             return True
         except ValueError:
-            log(f"DELAY: invalid value: {cmd[6:]}")
+            log(f"DELAY: invalid value: {cmd[6:]}", "ERROR")
             return False
 
     if cmd.startswith("TYPE "):
-    log(f"EXEC: {cmd}")
-    cmd = cmd.strip()
-
-    if not cmd or cmd == "PING":
-        return True
-
-    if cmd.startswith("TYPE "):
         text = cmd[5:]
-        log(f"TYPE: {text[:50]}{'...' if len(text)>50 else ''}")
+        log(f"TYPE: {text[:50]}{'...' if len(text) > 50 else ''}")
         return type_text(text)
 
     if cmd.startswith("KEY "):
@@ -303,7 +293,7 @@ def poll_loop():
                     log(f"CMD: {cmd}")
                     execute(cmd)
         except Exception as e:
-            log(f"Poll error: {e}")
+            log(f"Poll error: {e}", "ERROR")
 
         for _ in range(int(POLL_INTERVAL * 10)):
             if not running:
@@ -339,7 +329,7 @@ def health_server(port=HEALTH_PORT):
         srv = HTTPServer(("0.0.0.0", port), H)
         srv.serve_forever()
     except Exception as e:
-        log(f"Health server error: {e}")
+        log(f"Health server error: {e}", "ERROR")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -363,7 +353,7 @@ def main():
     ARCHIMADE_SERVER = f"http://{ARCHIMADE_HOST}:{ARCHIMADE_PORT}"
 
     if not DEVICE_TOKEN:
-        log("ERROR: No token provided. Usage: archibox-agent.exe <token> [device_id] [archimade_host] [port]")
+        log("ERROR: No token provided. Usage: archibox-agent.exe <token> [device_id] [archimade_host] [port]", "ERROR")
         sys.exit(1)
 
     log(f"Token: {DEVICE_TOKEN[:8]}...")
